@@ -7,9 +7,8 @@ blockade.py — модуль для userbot (Telethon).
     ...
     await blockade.teardown(client)  # корректная остановка модуля
 
-Теперь модуль при setup() автоматически проверяет BOT_TOKEN и при валидном токене
-запускает внутренний poller бота (getUpdates) — это нужно, чтобы создавать чеки
-(createInvoiceLink) и отслеживать успешные оплаты.
+Этот вариант содержит ADMIN_ID (можно задать в коде или через переменную окружения ADMIN_ID)
+чтобы только админ мог выполнять .refund.
 """
 import os
 import asyncio
@@ -29,18 +28,20 @@ from telethon.errors import (
 )
 
 # ==========================
-# Основная конфигурация — поставьте только BOT_TOKEN
-BOT_TOKEN = "8558132355:AAEOyM0kqHzP7g3olZE_fngicMs4HpLIOPw"  # <-- вставьте сюда токен вида 123456:ABCdefGhIJK...
+# Основная конфигурация — поставьте только BOT_TOKEN и (опционально) ADMIN_ID
+BOT_TOKEN = ""  # <-- вставьте сюда токен вида 123456:ABCdefGhIJK...
 # Опционально: provider token для платёжного провайдера (если требуется)
 PROVIDER_TOKEN = ""
+
+# Admin ID: можно указать прямо здесь как int, или установить переменную окружения ADMIN_ID
+# Пример: ADMIN_ID = 123456789
+ADMIN_ID = None
+
 # Остальные настройки оставлены по умолчанию — менять не обязательно
 CURRENCY = "XTR"
 AMOUNT_MULTIPLIER = 1
 MAX_INVOICE_ATTEMPTS = 6
 REQUEST_TIMEOUT = 20
-
-# Админская команда .refund будет доступна только если вы укажете ADMIN_ID (int).
-ADMIN_ID = None
 
 REFUND_API_URL = ""
 REFUND_API_KEY = ""
@@ -52,12 +53,24 @@ BOT_POLL_INTERVAL = 1.0
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s: %(message)s")
 log = logging.getLogger("telethon-invoice")
 
-# Попытка взять токен из переменных окружения, если в коде не заполнен
+# Попытка взять BOT_TOKEN из переменных окружения, если в коде не заполнен
 if not BOT_TOKEN:
     BOT_TOKEN = (os.getenv("BOT_TOKEN") or os.getenv("TELEGRAM_BOT_TOKEN") or "").strip()
 
+# Попытка взять ADMIN_ID из окружения, если не задан в коде
+if ADMIN_ID is None:
+    admin_env = os.getenv("ADMIN_ID") or os.getenv("TELEGRAM_ADMIN_ID")
+    if admin_env:
+        try:
+            ADMIN_ID = int(admin_env)
+        except Exception:
+            log.warning("ADMIN_ID из окружения некорректен (не число): %r", admin_env)
+            ADMIN_ID = None
+
 if not BOT_TOKEN:
     log.warning("BOT_TOKEN не задан; вызовы Bot API будут падать без валидного токена.")
+if ADMIN_ID is None:
+    log.info("ADMIN_ID не задан — команда .refund будет недоступна для ограничений по admin.")
 
 
 # NOTE:
@@ -85,7 +98,6 @@ def _call_bot_api_sync(method: str, data: dict = None, files: dict = None) -> di
         if files:
             r = requests.post(url, data=(data or {}), files=files, timeout=REQUEST_TIMEOUT)
         else:
-            # use POST with empty data or provided data
             r = requests.post(url, data=(data or {}), timeout=REQUEST_TIMEOUT)
     except Exception as e:
         log.exception("HTTP request to Bot API failed for %s", method)
@@ -339,6 +351,7 @@ async def outgoing_handler(event: events.NewMessage.Event):
 
     # .refund
     if text.lower().startswith(".refund"):
+        # проверяем ADMIN_ID — только он может выполнять возврат
         if ADMIN_ID is None or event.sender_id != ADMIN_ID:
             sent = await event.reply("Нет прав на выполнение .refund.")
             schedule_delete(event.chat_id, event.message.id, DELETION_DELAY)
