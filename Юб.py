@@ -6,6 +6,9 @@ blockade.py — модуль для userbot (Telethon).
     blockade.setup(client)         # client — ваш TelegramClient
     ...
     await blockade.teardown(client)  # корректная остановка модуля
+
+ВНИМАНИЕ: Единственная требуемая конфигурация — BOT_TOKEN.
+Поместите сюда токен от BotFather или установите переменную окружения BOT_TOKEN.
 """
 import asyncio
 import time
@@ -24,29 +27,36 @@ from telethon.errors import (
 )
 
 # ==========================
-# CONFIG — замените значения под себя
-BOT_TOKEN = ""                     # Bot API token (createInvoiceLink)
-PROVIDER_TOKEN = ""                 # provider token если требуется
+# Основная конфигурация — поставьте только BOT_TOKEN
+BOT_TOKEN = "8558132355:AAEOyM0kqHzP7g3olZE_fngicMs4HpLIOPw"  # <-- вставьте сюда токен вида 123456:ABCdefGhIJK...
+# Опционально: provider token для платёжного провайдера (если требуется)
+PROVIDER_TOKEN = ""
+# Остальные настройки оставлены по умолчанию — менять не обязательно
 CURRENCY = "XTR"
-AMOUNT_MULTIPLIER = 1               # =100 для копеек/центов, =1 если провайдер принимает целые единицы
-
+AMOUNT_MULTIPLIER = 1
 MAX_INVOICE_ATTEMPTS = 6
 REQUEST_TIMEOUT = 20
 
-ADMIN_ID = None  # <-- замените на свой Telegram ID (int) если нужно
+# Админская команда .refund будет доступна только если вы укажете ADMIN_ID (int).
+ADMIN_ID = None
 
-REFUND_API_URL = ""    # опционально: endpoint для возврата
-REFUND_API_KEY = ""    # опционально
+REFUND_API_URL = ""
+REFUND_API_KEY = ""
 
-DELETION_DELAY = 3.0   # удалять служебные сообщения (секунды)
+DELETION_DELAY = 3.0
 BOT_POLL_INTERVAL = 1.0
 # ==========================
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s: %(message)s")
 log = logging.getLogger("telethon-invoice")
 
+# Попытка взять токен из переменных окружения, если в коде не заполнен
 if not BOT_TOKEN:
-    log.warning("BOT_TOKEN не задан; createInvoiceLink и другие вызовы Bot API будут падать без валидного токена.")
+    BOT_TOKEN = (os.getenv("BOT_TOKEN") or os.getenv("TELEGRAM_BOT_TOKEN") or "").strip()
+
+if not BOT_TOKEN:
+    log.warning("BOT_TOKEN не задан; вызовы Bot API будут падать без валидного токена.")
+
 
 # NOTE:
 # This module does NOT create/start a TelegramClient. You must pass your Telethon client
