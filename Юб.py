@@ -1,14 +1,4 @@
-"""
-blockade.py — модуль для userbot (Telethon).
-Интеграция:
-    import blockade
-    blockade.setup(client)         # client — ваш TelegramClient
-    ...
-    await blockade.teardown(client)  # корректная остановка модуля
-
-Поддержка custom premium emoji: укажите INVOICE_CUSTOM_EMOJI_ID (int) или переменную окружения
-INVOICE_CUSTOM_EMOJI_ID, тогда в сообщении-чеке будет вставлен именно этот custom emoji.
-"""
+# contents of file
 import os
 import asyncio
 import time
@@ -37,6 +27,7 @@ INVOICE_EMOJI = "⭐"
 
 # Если хотите использовать custom premium emoji, укажите его ID (int) здесь или через окружение:
 # Пример: INVOICE_CUSTOM_EMOJI_ID = 5391176922854096298
+# <-- ВАЖНО: поставил ваш ID здесь:
 INVOICE_CUSTOM_EMOJI_ID = 5391176922854096298
 
 # Admin ID: можно указать прямо здесь или через ADMIN_ID в окружении
@@ -487,7 +478,9 @@ async def outgoing_handler(event: events.NewMessage.Event):
             if INVOICE_CUSTOM_EMOJI_ID:
                 # placeholder position is after "Оплата " (offset + len(payment_text) + 1)
                 emoji_offset = offset + len(payment_text) + 1
-                entities.append(MessageEntityCustomEmoji(offset=emoji_offset, length=1, custom_emoji_id=INVOICE_CUSTOM_EMOJI_ID))
+                # NOTE: In some Telethon versions MessageEntityCustomEmoji expects positional args
+                # (offset, length, custom_emoji_id). Using positional form is most compatible.
+                entities.append(MessageEntityCustomEmoji(emoji_offset, 1, INVOICE_CUSTOM_EMOJI_ID))
             else:
                 # fallback: append unicode emoji directly (replace placeholder with emoji char)
                 message_text = message_text.replace(placeholder_char, INVOICE_EMOJI or "")
