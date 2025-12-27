@@ -7,9 +7,11 @@ blockade.py — модуль для userbot (Telethon).
     ...
     await blockade.teardown(client)  # корректная остановка модуля
 
-ВНИМАНИЕ: Единственная требуемая конфигурация — BOT_TOKEN.
-Поместите сюда токен от BotFather или установите переменную окружения BOT_TOKEN.
+Теперь модуль при setup() автоматически проверяет BOT_TOKEN и при валидном токене
+запускает внутренний poller бота (getUpdates) — это нужно, чтобы создавать чеки
+(createInvoiceLink) и отслеживать успешные оплаты.
 """
+import os
 import asyncio
 import time
 import uuid
@@ -77,13 +79,14 @@ _BOT_TASK = None  # asyncio.Task for bot_updates_task
 
 
 # ---- Blocking Bot API helper and async wrapper ----
-def _call_bot_api_sync(method: str, data: dict, files: dict = None) -> dict:
+def _call_bot_api_sync(method: str, data: dict = None, files: dict = None) -> dict:
     url = f"https://api.telegram.org/bot{BOT_TOKEN}/{method}"
     try:
         if files:
-            r = requests.post(url, data=data, files=files, timeout=REQUEST_TIMEOUT)
+            r = requests.post(url, data=(data or {}), files=files, timeout=REQUEST_TIMEOUT)
         else:
-            r = requests.post(url, data=data, timeout=REQUEST_TIMEOUT)
+            # use POST with empty data or provided data
+            r = requests.post(url, data=(data or {}), timeout=REQUEST_TIMEOUT)
     except Exception as e:
         log.exception("HTTP request to Bot API failed for %s", method)
         return {"ok": False, "description": f"HTTP request failed: {e}"}
@@ -96,7 +99,7 @@ def _call_bot_api_sync(method: str, data: dict, files: dict = None) -> dict:
         return {"ok": False, "description": f"Invalid JSON response from Bot API: {r.text}", "http_status": r.status_code}
 
 
-async def call_bot_api(method: str, data: dict, files: dict = None) -> dict:
+async def call_bot_api(method: str, data: dict = None, files: dict = None) -> dict:
     loop = asyncio.get_running_loop()
     return await loop.run_in_executor(None, lambda: _call_bot_api_sync(method, data, files))
 
@@ -517,10 +520,30 @@ async def _stop_bot_task():
         log.info("bot_updates_task stopped (module)")
 
 
+async def _ensure_bot_token_and_start():
+    """
+    Проверяет BOT_TOKEN через getMe и при успехе запускает bot_updates_task.
+    Вызывается в setup() — выполняется в loop клиента.
+    """
+    if not BOT_TOKEN:
+        log.warning("BOT_TOKEN пустой — бот-поллинг не будет запущен.")
+        return
+    try:
+        resp = await call_bot_api("getMe", {})
+        if not resp.get("ok"):
+            log.error("Bot API getMe failed: %s", resp)
+            return
+        me = resp.get("result")
+        log.info("Bot token valid — bot username: %s (id=%s). Starting bot poller.", me.get("username"), me.get("id"))
+        await _start_bot_task()
+    except Exception:
+        log.exception("Failed to validate BOT_TOKEN with getMe; bot-poller will not start.")
+
+
 def setup(client_obj):
     """
     Initialize this module with an existing Telethon client instance.
-    Registers handlers and starts the bot polling task.
+    Registers handlers and starts the bot polling task (if BOT_TOKEN is valid).
 
     Call this from your main bot where you have a TelegramClient:
         blockade.setup(client)
@@ -534,14 +557,13 @@ def setup(client_obj):
     client.add_event_handler(outgoing_handler, eb_outgoing)
     _REGISTERED_HANDLERS.append((outgoing_handler, eb_outgoing))
 
-    # start bot_updates_task on client's loop
+    # start bot_updates_task on client's loop after token check
     try:
-        # prefer client's loop to schedule task
         if hasattr(client, "loop") and client.loop is not None:
-            client.loop.create_task(_start_bot_task())
+            # schedule token check + start poller on client's loop
+            client.loop.create_task(_ensure_bot_token_and_start())
         else:
-            # fallback to current loop
-            asyncio.get_event_loop().create_task(_start_bot_task())
+            asyncio.get_event_loop().create_task(_ensure_bot_token_and_start())
     except Exception:
         log.exception("Failed to start bot_updates_task in setup()")
 
