@@ -1,14 +1,13 @@
 """
 blockade.py — модуль для userbot (Telethon).
-Не создаёт и не запускает TelegramClient сам по себе.
 Интеграция:
     import blockade
     blockade.setup(client)         # client — ваш TelegramClient
     ...
     await blockade.teardown(client)  # корректная остановка модуля
 
-Этот вариант содержит ADMIN_ID (можно задать в коде или через переменную окружения ADMIN_ID)
-чтобы только админ мог выполнять .refund.
+Поддержка custom premium emoji: укажите INVOICE_CUSTOM_EMOJI_ID (int) или переменную окружения
+INVOICE_CUSTOM_EMOJI_ID, тогда в сообщении-чеке будет вставлен именно этот custom emoji.
 """
 import os
 import asyncio
@@ -26,26 +25,30 @@ from telethon.errors import (
     PeerIdInvalidError,
     RpcCallFailError,
 )
+from telethon.tl.types import MessageEntityTextUrl, MessageEntityCustomEmoji
 
 # ==========================
-# Основная конфигурация — поставьте только BOT_TOKEN и (опционально) ADMIN_ID
-BOT_TOKEN = ""  # <-- вставьте сюда токен вида 123456:ABCdefGhIJK...
-# Опционально: provider token для платёжного провайдера (если требуется)
+# Основная конфигурация — поставьте BOT_TOKEN и (опционально) ADMIN_ID
+BOT_TOKEN = "8558132355:AAEOyM0kqHzP7g3olZE_fngicMs4HpLIOPw"            # вставьте токен BotFather или установите BOT_TOKEN в окружении
 PROVIDER_TOKEN = ""
 
-# Admin ID: можно указать прямо здесь как int, или установить переменную окружения ADMIN_ID
-# Пример: ADMIN_ID = 123456789
-ADMIN_ID = None
+# Unicode emoji (fallback). Если указан INVOICE_CUSTOM_EMOJI_ID, будет использован custom emoji вместо этого.
+INVOICE_EMOJI = "⭐"
 
-# Остальные настройки оставлены по умолчанию — менять не обязательно
+# Если хотите использовать custom premium emoji, укажите его ID (int) здесь или через окружение:
+# Пример: INVOICE_CUSTOM_EMOJI_ID = 5391176922854096298
+INVOICE_CUSTOM_EMOJI_ID = 5391176922854096298
+
+# Admin ID: можно указать прямо здесь или через ADMIN_ID в окружении
+ADMIN_ID = 7738435649
+
+# Остальное
 CURRENCY = "XTR"
 AMOUNT_MULTIPLIER = 1
 MAX_INVOICE_ATTEMPTS = 6
 REQUEST_TIMEOUT = 20
-
 REFUND_API_URL = ""
 REFUND_API_KEY = ""
-
 DELETION_DELAY = 3.0
 BOT_POLL_INTERVAL = 1.0
 # ==========================
@@ -53,45 +56,47 @@ BOT_POLL_INTERVAL = 1.0
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s: %(message)s")
 log = logging.getLogger("telethon-invoice")
 
-# Попытка взять BOT_TOKEN из переменных окружения, если в коде не заполнен
+# Load BOT_TOKEN, ADMIN_ID, INVOICE_CUSTOM_EMOJI_ID from env if not set
 if not BOT_TOKEN:
     BOT_TOKEN = (os.getenv("BOT_TOKEN") or os.getenv("TELEGRAM_BOT_TOKEN") or "").strip()
 
-# Попытка взять ADMIN_ID из окружения, если не задан в коде
 if ADMIN_ID is None:
     admin_env = os.getenv("ADMIN_ID") or os.getenv("TELEGRAM_ADMIN_ID")
     if admin_env:
         try:
             ADMIN_ID = int(admin_env)
         except Exception:
-            log.warning("ADMIN_ID из окружения некорректен (не число): %r", admin_env)
+            log.warning("ADMIN_ID из окружения некорректен: %r", admin_env)
             ADMIN_ID = None
+
+if INVOICE_CUSTOM_EMOJI_ID is None:
+    custom_env = os.getenv("INVOICE_CUSTOM_EMOJI_ID")
+    if custom_env:
+        try:
+            INVOICE_CUSTOM_EMOJI_ID = int(custom_env)
+        except Exception:
+            log.warning("INVOICE_CUSTOM_EMOJI_ID из окружения некорректен: %r", custom_env)
+            INVOICE_CUSTOM_EMOJI_ID = None
 
 if not BOT_TOKEN:
     log.warning("BOT_TOKEN не задан; вызовы Bot API будут падать без валидного токена.")
 if ADMIN_ID is None:
-    log.info("ADMIN_ID не задан — команда .refund будет недоступна для ограничений по admin.")
+    log.info("ADMIN_ID не задан — команда .refund будет недоступна или доступна всем.")
 
-
-# NOTE:
-# This module does NOT create/start a TelegramClient. You must pass your Telethon client
-# instance into setup(client). The module will register handlers and start a background
-# poller that calls Telegram Bot API (getUpdates) to catch payments and pre-checkout queries.
 
 # module-level client (set in setup)
 client = None  # type: Optional[object]
 
-# in-memory mapping payload -> info
-# info: { "user_chat_id": int, "user_msg_id": int, "initiator_id": int, "thank_text": str, ... }
+# in-memory invoice mapping
 INVOICE_MAP = {}
 INVOICE_MAP_LOCK = asyncio.Lock()
 
-# handlers and background task references (for teardown)
-_REGISTERED_HANDLERS = []  # list of tuples: (func, event_builder)
-_BOT_TASK = None  # asyncio.Task for bot_updates_task
+# handlers and background task references
+_REGISTERED_HANDLERS = []
+_BOT_TASK = None
 
 
-# ---- Blocking Bot API helper and async wrapper ----
+# ---- Bot API helpers ----
 def _call_bot_api_sync(method: str, data: dict = None, files: dict = None) -> dict:
     url = f"https://api.telegram.org/bot{BOT_TOKEN}/{method}"
     try:
@@ -148,9 +153,10 @@ def schedule_delete(entity, message_id, delay=DELETION_DELAY):
 
 # ---- createInvoiceLink (async) ----
 async def create_invoice_link_via_bot(title: str, description: str, amount: int, base_payload: str,
-                                      max_attempts: int = MAX_INVOICE_ATTEMPTS, provider_token: str = PROVIDER_TOKEN) -> dict:
+                                      max_attempts: int = MAX_INVOICE_ATTEMPTS, provider_token: str = None) -> dict:
     method = "createInvoiceLink"
     prices = [{"label": title, "amount": int(amount) * AMOUNT_MULTIPLIER}]
+    provider_token = provider_token if provider_token is not None else PROVIDER_TOKEN
 
     for attempt in range(1, max_attempts + 1):
         payload = f"{base_payload}_{int(time.time())}_{uuid.uuid4().hex[:8]}_{random.randint(0,9999)}_a{attempt}"
@@ -210,7 +216,7 @@ async def perform_refund(user_id: str, telegram_payment_charge_id: str) -> dict:
         return await call_bot_api("refundStarPayment", {"user_id": user_id, "telegram_payment_charge_id": telegram_payment_charge_id})
 
 
-# ---- Async poller (runs inside Telethon loop) ----
+# ---- bot poller ----
 async def bot_updates_task():
     log.info("Starting bot_updates_task...")
     url_get = f"https://api.telegram.org/bot{BOT_TOKEN}/getUpdates"
@@ -253,7 +259,6 @@ async def bot_updates_task():
             for upd in results:
                 offset = upd["update_id"] + 1
 
-                # pre_checkout_query -> answer ok=True
                 if "pre_checkout_query" in upd:
                     pcq = upd["pre_checkout_query"]
                     pcq_id = pcq.get("id")
@@ -269,7 +274,6 @@ async def bot_updates_task():
                     else:
                         log.debug("PreCheckoutQuery answered ok id=%s", pcq_id)
 
-                # message -> possible successful_payment
                 if "message" in upd:
                     msg = upd["message"]
                     if "successful_payment" in msg:
@@ -288,7 +292,6 @@ async def bot_updates_task():
 
                         if mapping:
                             log.info("Found mapping for payload %s: %s", invoice_payload, mapping)
-                            # delete the user message (the link) if present
                             user_chat_id = mapping.get("user_chat_id")
                             user_msg_id = mapping.get("user_msg_id")
                             if user_chat_id and user_msg_id:
@@ -298,7 +301,6 @@ async def bot_updates_task():
                                     log.debug("Deleted user invoice message %s:%s", user_chat_id, user_msg_id)
                                 except Exception:
                                     log.exception("Failed to delete user invoice message via Telethon")
-                            # delete bot message if any (some providers may return bot invoice)
                             bot_chat_id = mapping.get("bot_chat_id")
                             bot_msg_id = mapping.get("bot_msg_id")
                             if bot_chat_id and bot_msg_id:
@@ -310,7 +312,6 @@ async def bot_updates_task():
                                 else:
                                     log.debug("Deleted bot invoice message %s:%s", bot_chat_id, bot_msg_id)
 
-                            # send thank-you in the same chat
                             try:
                                 thank_text = mapping.get("thank_text") or "Спасибо за покупку!"
                                 target_chat = mapping.get("user_chat_id") or payer_id
@@ -336,7 +337,6 @@ async def outgoing_handler(event: events.NewMessage.Event):
     if not text:
         return
 
-    # .info
     if text.lower().startswith(".info"):
         info_text = (
             "Команды:\n"
@@ -349,9 +349,7 @@ async def outgoing_handler(event: events.NewMessage.Event):
         schedule_delete(sent.chat_id, sent.id, DELETION_DELAY)
         return
 
-    # .refund
     if text.lower().startswith(".refund"):
-        # проверяем ADMIN_ID — только он может выполнять возврат
         if ADMIN_ID is None or event.sender_id != ADMIN_ID:
             sent = await event.reply("Нет прав на выполнение .refund.")
             schedule_delete(event.chat_id, event.message.id, DELETION_DELAY)
@@ -383,7 +381,6 @@ async def outgoing_handler(event: events.NewMessage.Event):
         schedule_delete(sent.chat_id, sent.id, DELETION_DELAY)
         return
 
-    # .star — создаём ссылку и отправляем ТОЛЬКО plain text: title + description + ссылка
     if text.lower().startswith(".star"):
         parts = text.split()
         if len(parts) == 2 and event.is_reply:
@@ -438,11 +435,12 @@ async def outgoing_handler(event: events.NewMessage.Event):
             schedule_delete(sent.chat_id, sent.id, DELETION_DELAY)
             return
 
-        title = f"Покупка {amount} булочки"
-        description = f"Оплата {amount} булочки ({CURRENCY})."
+        # Формируем чек
+        title = f"Чек на {amount} звёзд"
+        description = f"Описание: Оплата {amount} звёзд ({CURRENCY})."
         base_payload = f"user_invoice_{event.sender_id}"
 
-        # create invoice link (always use createInvoiceLink to get URL)
+        # create invoice link
         link_resp = await create_invoice_link_via_bot(title=title, description=description, amount=amount, base_payload=base_payload)
         if not link_resp.get("ok"):
             log.error("createInvoiceLink failed: %s", link_resp)
@@ -472,11 +470,36 @@ async def outgoing_handler(event: events.NewMessage.Event):
             log.warning("createInvoiceLink result has no url: %s", result)
             return
 
-        # send single plain-text message with title, description and URL (no keyboard, no extra confirmations)
+        # Формируем текст и entities: "Оплата" — маскированная ссылка, и сразу после — custom emoji (если задан)
         try:
-            message_text = f"{title}\n{description}\n{invoice_url}"
-            user_msg = await client.send_message(entity=target_id, message=message_text) if client is not None else None
-            # register mapping so we can delete this message on successful payment
+            # текст: заголовок + описание + строка с "Оплата " + placeholder_char
+            placeholder_char = "\uFFFC"  # object replacement character — один символ для custom emoji entity
+            payment_text = "Оплата"
+            message_text = f"{title}\n{description}\n{payment_text} {placeholder_char}"
+
+            entities = []
+            # find offset of payment_text
+            offset = message_text.rfind(payment_text)
+            if offset >= 0:
+                entities.append(MessageEntityTextUrl(offset=offset, length=len(payment_text), url=invoice_url))
+
+            # add custom emoji entity if configured
+            if INVOICE_CUSTOM_EMOJI_ID:
+                # placeholder position is after "Оплата " (offset + len(payment_text) + 1)
+                emoji_offset = offset + len(payment_text) + 1
+                entities.append(MessageEntityCustomEmoji(offset=emoji_offset, length=1, custom_emoji_id=INVOICE_CUSTOM_EMOJI_ID))
+            else:
+                # fallback: append unicode emoji directly (replace placeholder with emoji char)
+                message_text = message_text.replace(placeholder_char, INVOICE_EMOJI or "")
+                # no custom entity needed
+
+            # send message without parse_mode but with entities (if custom used)
+            if INVOICE_CUSTOM_EMOJI_ID:
+                user_msg = await client.send_message(entity=target_id, message=message_text, entities=entities, link_preview=False)
+            else:
+                user_msg = await client.send_message(entity=target_id, message=message_text, link_preview=False)
+
+            # register mapping for deletion on successful payment
             await register_invoice(used_payload, {
                 "type": "user",
                 "bot_chat_id": None,
@@ -486,12 +509,14 @@ async def outgoing_handler(event: events.NewMessage.Event):
                 "initiator_id": event.sender_id,
                 "thank_text": "Спасибо за покупку!"
             })
-            # delete the command message (so chats don't get cluttered)
+
+            # delete command message
             try:
                 await client.delete_messages(event.chat_id, [event.message.id])
             except Exception:
                 schedule_delete(event.chat_id, event.message.id, 1.0)
             return
+
         except UserIsBlockedError:
             sent = await event.reply("Не удалось отправить ссылку: пользователь заблокировал вас.")
             schedule_delete(event.chat_id, event.message.id, DELETION_DELAY)
@@ -511,7 +536,7 @@ async def outgoing_handler(event: events.NewMessage.Event):
             schedule_delete(sent.chat_id, sent.id, DELETION_DELAY)
 
 
-# ------------------- Module lifecycle: setup / teardown -----------------------
+# ------------------- Module lifecycle -----------------------
 async def _start_bot_task():
     global _BOT_TASK
     if _BOT_TASK is None or _BOT_TASK.done():
@@ -534,10 +559,6 @@ async def _stop_bot_task():
 
 
 async def _ensure_bot_token_and_start():
-    """
-    Проверяет BOT_TOKEN через getMe и при успехе запускает bot_updates_task.
-    Вызывается в setup() — выполняется в loop клиента.
-    """
     if not BOT_TOKEN:
         log.warning("BOT_TOKEN пустой — бот-поллинг не будет запущен.")
         return
@@ -554,26 +575,16 @@ async def _ensure_bot_token_and_start():
 
 
 def setup(client_obj):
-    """
-    Initialize this module with an existing Telethon client instance.
-    Registers handlers and starts the bot polling task (if BOT_TOKEN is valid).
-
-    Call this from your main bot where you have a TelegramClient:
-        blockade.setup(client)
-    """
     global client, _REGISTERED_HANDLERS
 
     client = client_obj
 
-    # register outgoing handler (userbot: outgoing=True)
     eb_outgoing = events.NewMessage(outgoing=True)
     client.add_event_handler(outgoing_handler, eb_outgoing)
     _REGISTERED_HANDLERS.append((outgoing_handler, eb_outgoing))
 
-    # start bot_updates_task on client's loop after token check
     try:
         if hasattr(client, "loop") and client.loop is not None:
-            # schedule token check + start poller on client's loop
             client.loop.create_task(_ensure_bot_token_and_start())
         else:
             asyncio.get_event_loop().create_task(_ensure_bot_token_and_start())
@@ -582,19 +593,13 @@ def setup(client_obj):
 
 
 async def teardown(client_obj):
-    """
-    Cleanly stop background task(s) and unregister handlers.
-    Call await blockade.teardown(client) when you want to unload the module.
-    """
     global client, _REGISTERED_HANDLERS
 
-    # stop bot task
     try:
         await _stop_bot_task()
     except Exception:
         log.exception("Error stopping bot task in teardown")
 
-    # remove registered handlers
     try:
         if client is not None:
             for func, ev in list(_REGISTERED_HANDLERS):
@@ -606,10 +611,8 @@ async def teardown(client_obj):
     except Exception:
         log.exception("Error while removing handlers in teardown")
 
-    # clear client reference
     client = None
 
-    # clear invoice map
     try:
         async with INVOICE_MAP_LOCK:
             INVOICE_MAP.clear()
